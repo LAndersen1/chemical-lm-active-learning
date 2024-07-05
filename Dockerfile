@@ -4,7 +4,6 @@ FROM nvcr.io/nvidia/pytorch:22.02-py3 AS base
 # Set path to CUDA
 ENV CUDA_HOME=/usr/local/cuda
 
-COPY pyscreener_environment.yml .
 COPY environment.yml .
 
 # Essentials
