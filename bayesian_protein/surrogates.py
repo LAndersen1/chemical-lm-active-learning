@@ -188,6 +188,9 @@ class BayesianRidgePrior(RegressorMixin, LinearModel):
         Riquelme et al., 2018
     """
 
+    # Required by sklearn
+    _parameter_constraints = {"fit_intercept": ["boolean"], "copy_X": ["boolean"]}
+
     def __init__(
         self, a_init, b_init, precision_init, fit_intercept=True, copy_X: bool = True
     ):
