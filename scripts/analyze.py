@@ -26,7 +26,7 @@ data = pd.read_sql(
 # Validation results
 val = pd.read_sql(
     """
-    SELECT embedding_model, mean_absolute_error, mean_squared_error, R2, iteration, sampler FROM validation_summary
+    SELECT embedding_model, mean_absolute_error, mean_squared_error, R2, iteration, sampler, surrogate FROM validation_summary
     JOIN experiment on validation_summary.experiment_id == experiment.id
     WHERE sampler != "random"
 """,
@@ -34,65 +34,67 @@ val = pd.read_sql(
 )
 
 ### Average affinity over all iterations
-barplot = sns.barplot(
-    data.groupby(["embedding_model", "sampler"])["affinity"].mean().reset_index(),
+barplot = sns.catplot(
+    data,
     y="affinity",
     x="embedding_model",
     hue="sampler",
+    col="surrogate",
+    kind="point",
 )
 
 if args.out is not None:
-    barplot.get_figure().savefig(args.out / f"{PREFIX}_avg_affinity.png")
+    barplot.figure.savefig(args.out / f"{PREFIX}_avg_affinity.png")
 plt.clf()
 ### Affinity progression of the iterations
-lineplot = sns.lineplot(
+lineplot = sns.relplot(
     data[data["iteration"] >= 0],
     y="affinity",
     x="iteration",
     hue="embedding_model",
     style="sampler",
-)
-lineplot.set_xticks(
-    ticks=range(data["iteration"].max()), labels=range(1, data["iteration"].max() + 1)
+    row="surrogate",
+    kind="line",
 )
 
 if args.out is not None:
-    lineplot.get_figure().savefig(args.out / f"{PREFIX}_progression.png")
+    lineplot.figure.savefig(args.out / f"{PREFIX}_progression.png")
 plt.clf()
 ### Percentage of top 100 molecules found
 pool = pd.read_csv(data["data_path"].unique()[0])
 top100 = pool.loc[pool["target"].nsmallest(100).index]
 top100percentage = (
-    data.groupby(["embedding_model", "sampler", "iteration"])
+    data.groupby(["embedding_model", "sampler", "surrogate", "iteration"])
     .apply(lambda x: x["molecule"].isin(top100["smiles"]).sum())
     .rename("Percentage of Top 100 scores found")
-    .groupby(level=[0, 1])
+    .groupby(level=[0, 1, 2])
     .cumsum()
 )
 mols_screened = (
-    data.groupby(["embedding_model", "sampler", "iteration"])
+    data.groupby(["embedding_model", "sampler", "surrogate", "iteration"])
     .apply(len)
-    .groupby(level=[0, 1])
+    .groupby(level=[0, 1, 2])
     .cumsum()
     .rename("Molecules screened")
 )
 combined = pd.concat([top100percentage, mols_screened], axis=1)
-top100plot = sns.lineplot(
+top100plot = sns.relplot(
     combined,
     x="Molecules screened",
     y="Percentage of Top 100 scores found",
     hue="embedding_model",
     style="sampler",
-    markers=True,
+    col="surrogate",
+    kind="line",
 )
 if args.out is not None:
-    top100plot.get_figure().savefig(args.out / f"{PREFIX}_top100.png")
+    top100plot.figure.savefig(args.out / f"{PREFIX}_top100.png")
 plt.clf()
 
 ### Validation results
 val_long = pd.melt(
     val,
-    id_vars=["embedding_model", "sampler", "iteration"],
+    id_vars=["embedding_model", "sampler", "surrogate", "iteration"],
     value_vars=["mean_absolute_error", "mean_squared_error", "R2"],
     var_name="metric",
 )
@@ -103,8 +105,8 @@ val_plot = sns.relplot(
     hue="embedding_model",
     col="metric",
     style="sampler",
-    markers=True,
     kind="line",
+    row="surrogate",
 )
 
 
