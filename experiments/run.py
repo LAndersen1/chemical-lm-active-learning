@@ -29,6 +29,12 @@ if __name__ == "__main__":
 
     jobs = parse_args()
     for args in jobs:
+        if args.surrogate == "constant" and args.sampler != "random":
+            continue
+
+        elif args.sampler == "random" and args.surrogate != "constant":
+            continue
+
         optimizer = Optimizer(
             args,
             get_data_with_embeddings(
