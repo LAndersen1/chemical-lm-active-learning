@@ -11,6 +11,7 @@ from sklearn.base import RegressorMixin, _fit_context
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.linear_model import BayesianRidge
 from sklearn.linear_model._base import LinearModel, _preprocess_data  # noqa
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.utils import check_array
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset, random_split, Dataset
@@ -312,6 +313,26 @@ class LinearPrior(BaseSurrogate):
         ei += (df / (df - 1)) * (1 + z**2 / df) * std * stats.t.pdf(z, df)
         assert ei.size == 1
         return ei.item()
+
+class RFSurrogate(GaussianSurrogate):
+
+    def __init__(self):
+        super().__init__()
+        self._model = RandomForestRegressor(random_state=0)
+
+    def _fit(self, X: np.ndarray, y: np.ndarray):
+        """
+        :param X: (N, D) Design matrix
+        :param y: (N, 1) Targets
+        """
+        self._model.fit(X, y.reshape(-1))
+
+    def forward(self, X: np.ndarray, smiles) -> Tuple[np.ndarray, np.ndarray]:
+        self._check_forward_array(X)
+        trees = self._model.estimators_
+        predictions = [tree.predict(X) for tree in trees]
+
+        return np.mean(predictions, axis=0), np.std(predictions, axis=0)
 
 
 class ConstantSurrogate(BaseSurrogate):
@@ -643,6 +664,8 @@ def surrogate_factory(surrogate_model: Surrogate) -> BaseSurrogate:
         return MLPSurrogate()
     elif surrogate_model == "molformer":
         return MolformerSurrogate()
+    elif surrogate_model == "rf":
+        return RFSurrogate()
     else:
         raise ValueError(
             f"Invalid surrogate model {surrogate_model}. Valid choices are {', '.join(VALID_SURROGATE_MODELS)}"
