@@ -93,7 +93,7 @@ class Optimizer:
         self.experiment_id = self.db.insert_experiment(
             n_iter=self.args.n_iter,
             embedding_model=self.args.embedding,
-            output_dir=self.args.out,
+            output_file=self.args.out,
             data_path=self.args.data,
             sampler=self.args.sampler,
             surrogate=self.args.surrogate,

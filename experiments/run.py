@@ -1,5 +1,6 @@
 import functools
 import os
+import pathlib
 
 import pandas as pd
 
@@ -27,6 +28,8 @@ def get_data_with_embeddings(embedding_model: EmbeddingModel, csvfile: str):
 if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "true"  # Huggingface tokenizers
 
+    results_dir = pathlib.Path(__file__).parent.parent / "runs"
+
     jobs = parse_args()
     for args in jobs:
         if args.surrogate == "constant" and args.sampler != "random":
@@ -34,14 +37,15 @@ if __name__ == "__main__":
 
         elif args.sampler == "random" and args.surrogate != "constant":
             continue
-
+        
+        db_path = str(results_dir / f"{args.out}.sqlite")
         optimizer = Optimizer(
             args,
             get_data_with_embeddings(
                 embedding_model=args.embedding, csvfile=str(args.data)
             ).copy(),
             job_id=0,
-            database_path=str(args.out / "protein_ligand.sqlite"),
+            database_path=db_path,
         )
-        print(args.out)
+        print(db_path)
         optimizer.run()

@@ -15,7 +15,7 @@ class Experiment:
     surrogate: Surrogate
     protein: str
     seed: int
-    output_dir: Optional[str] = None
+    output_file: Optional[str] = None
     n_clusters: Optional[int] = 1
     simulator: Optional[Simulator] = None
     bandit_confidence: Optional[float] = None
@@ -33,7 +33,7 @@ class Experiment:
             surrogate TEXT not null,
             protein TEXT not null,
             seed INTEGER not null,
-            output_dir TEXT,
+            output_file TEXT,
             n_clusters INTEGER,
             simulator TEXT,
             bandit_confidence REAL,
@@ -52,7 +52,7 @@ class Experiment:
             surrogate,
             protein,
             seed,
-            output_dir,
+            output_file,
             n_clusters,
             simulator,
             bandit_confidence,
@@ -238,7 +238,7 @@ class Database:
         surrogate: Surrogate,
         protein: str,
         seed: int,
-        output_dir: Optional[Path] = None,
+        output_file: Optional[Path] = None,
         n_clusters: Optional[int] = 1,
         simulator: Optional[Simulator] = None,
         bandit_confidence: Optional[float] = None,
@@ -253,7 +253,7 @@ class Database:
             surrogate,
             protein,
             seed,
-            str(output_dir),
+            str(output_file),
             n_clusters,
             simulator,
             bandit_confidence,
