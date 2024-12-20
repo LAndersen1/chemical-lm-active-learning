@@ -111,9 +111,15 @@ class GaussianSurrogate(BaseSurrogate, abc.ABC):
         :return: (N,) Expected improvement for all points in the design matrix
         """
         mean, std = self.forward(X, smiles)
-        z = (best_seen - mean) / std
+        improvement = best_seen - mean
+        with np.errstate(divide='ignore', invalid='ignore'):
+            z = improvement / std
 
         ei = std * (z * stats.norm.cdf(z) + stats.norm.pdf(z))
+
+        # Zero standard deviation, then equal to improvement
+        invalid = std == 0
+        ei[invalid] = improvement[invalid]
 
         assert len(ei) == X.shape[0]
         return ei
@@ -128,9 +134,15 @@ class GaussianSurrogate(BaseSurrogate, abc.ABC):
         :return: Expected improvement of this point
         """
         mean, std = self.forward(x.reshape(1, -1), smiles)
-        z = (best_seen - mean) / std
 
-        ei = std * (z * stats.norm.cdf(z) + stats.norm.pdf(z))
+        improvement = best_seen - mean
+
+        if std != 0.0:
+            z = improvement / std
+            ei = std * (z * stats.norm.cdf(z) + stats.norm.pdf(z))
+        else:
+            # Zero standard deviation, then equal to improvement
+            ei = improvement
         assert ei.size == 1
         return ei.item()
 
@@ -285,10 +297,17 @@ class LinearPrior(BaseSurrogate):
     ) -> np.ndarray:
         df = 2 * self._model.a_
         mean, std = self.forward(X, smiles)
-        z = (best_seen - mean) / std
 
-        ei = (best_seen - mean) * stats.t.cdf(z, df)
+        improvement = best_seen - mean
+        with np.errstate(divide='ignore', invalid='ignore'):
+            z = improvement / std
+
+        ei = improvement * stats.t.cdf(z, df)
         ei += (df / (df - 1)) * (1 + z**2 / df) * std * stats.t.pdf(z, df)
+
+        invalid = std == 0
+        ei[invalid] = improvement[invalid]
+
         assert len(ei) == X.shape[0]
         return ei
 
@@ -307,10 +326,15 @@ class LinearPrior(BaseSurrogate):
         """
         df = 2 * self._model.a_
         mean, std = self.forward(x.reshape(1, -1), smiles)
-        z = (best_seen - mean) / std
+        improvement = best_seen - mean
 
-        ei = (best_seen - mean) * stats.t.cdf(z, df)
-        ei += (df / (df - 1)) * (1 + z**2 / df) * std * stats.t.pdf(z, df)
+        if std != 0.0:
+            z = improvement / std
+            ei = improvement * stats.t.cdf(z, df)
+            ei += (df / (df - 1)) * (1 + z**2 / df) * std * stats.t.pdf(z, df)
+        else:
+            ei = improvement
+
         assert ei.size == 1
         return ei.item()
 
