@@ -162,3 +162,10 @@ cython_debug/
 
 data/raw/*
 figures/*
+logs/*
+runs/*
+*.err
+*.out
+*.sqlite
+*.sub
+*.sh
