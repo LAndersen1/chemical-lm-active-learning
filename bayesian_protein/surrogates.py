@@ -381,8 +381,8 @@ class MLPSurrogate(GaussianSurrogate):
         self,
         forward_passes: int = 10,
         retrain: bool = True,
-        epochs=50,
-        early_stopping_patience: Optional[int] = 5,
+        epochs=150,
+        early_stopping_patience: Optional[int] = 25,
     ):
         """
         :param forward_passes: Number of forward passes
@@ -404,13 +404,13 @@ class MLPSurrogate(GaussianSurrogate):
 
     def _build_model(self, input_size: int):
         self.model = nn.Sequential(
-            nn.Linear(input_size, 100),
+            nn.Linear(input_size, 256),
             nn.ReLU(),
             nn.Dropout(p=0.2),
-            nn.Linear(100, 100),
+            nn.Linear(256, 24),
             nn.ReLU(),
-            nn.Dropout(p=0.2),
-            nn.Linear(100, 1),
+            #nn.Dropout(p=0.2),
+            nn.Linear(24, 1),
         ).to(self.device)
 
         self._ckpt = copy.deepcopy(self.model.state_dict())
@@ -428,16 +428,17 @@ class MLPSurrogate(GaussianSurrogate):
 
         super().update(x, y, smiles)
 
-    def _train_loop(self, loader: DataLoader, optimizer: torch.optim.Optimizer):
+    def _train_loop(self, loader: DataLoader, optimizer: torch.optim.Optimizer, lr_scheduler):
         avg = 0
         self.model.train()
         for i, (x, y) in enumerate(loader, start=1):
             x, y = x.to(self.device), y.squeeze().to(self.device)
             optimizer.zero_grad()
             output = self.model.forward(x).squeeze()
-            loss = nn.functional.mse_loss(output, y)
+            loss = nn.functional.huber_loss(output, y)
             loss.backward()
             optimizer.step()
+            lr_scheduler.step()
 
             # Update running average of loss
             avg += 1 / i * (loss.mean().item() - avg)
@@ -451,7 +452,7 @@ class MLPSurrogate(GaussianSurrogate):
         for i, (x, y) in enumerate(loader, start=1):
             x, y = x.to(self.device), y.squeeze().to(self.device)
             output = self.model.forward(x).squeeze()
-            loss = nn.functional.mse_loss(output, y)
+            loss = nn.functional.huber_loss(output, y)
             avg += 1 / i * (loss.mean().item() - avg)
 
         return avg
@@ -465,27 +466,41 @@ class MLPSurrogate(GaussianSurrogate):
             self._restore()
 
         # Setup data
-        tensor_x = torch.as_tensor(X, dtype=torch.float)
-        tensor_y = torch.as_tensor(y, dtype=torch.float)
+        tensor_x = torch.as_tensor(X, dtype=torch.float).cuda()
+        tensor_y = torch.as_tensor(y, dtype=torch.float).cuda()
         ds = TensorDataset(tensor_x, tensor_y)
         train_ds, val_ds = random_split(ds, lengths=[0.8, 0.2])
         train_loader = DataLoader(
             train_ds, batch_size=self._train_batch_size, shuffle=True
         )
         val_loader = DataLoader(val_ds, batch_size=self._inf_batch_size, shuffle=False)
-        optimizer = torch.optim.Adam(self.model.parameters())
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-5)
+        lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.001, epochs=self.epochs, steps_per_epoch=self._train_batch_size)
 
         # Train with early stopping
-        val_history = deque(maxlen=self.early_stopping_patience)
-        model_history = deque(maxlen=self.early_stopping_patience)
-        for _ in range(self.epochs):
-            self._train_loop(train_loader, optimizer)
+        #val_history = deque(maxlen=self.early_stopping_patience)
+        #model_history = deque(maxlen=self.early_stopping_patience)
+        min_val = None
+        best_min_after_n_epochs = 25
+        best_model = None
+        for current_epoch in range(self.epochs):
+            self._train_loop(train_loader, optimizer, lr_scheduler)
             val_loss = self._val_loop(val_loader)
+            if current_epoch > best_min_after_n_epochs:
+                if(min_val is None):
+                    min_val = val_loss
+                    best_model = copy.deepcopy(self.model.state_dict())
+                else:
+                    if val_loss <= min_val:
+                        min_val = val_loss
+                        best_model = copy.deepcopy(self.model.state_dict())
+            print(f"{val_loss} : {min_val} : {lr_scheduler.get_last_lr()}")
 
             # Validation loss has not improved in the last x epochs
-            if self.early_stopping_patience is not None:
-                if len(val_history) > self.early_stopping_patience and all(
-                    val_loss > other for other in val_history
+            """if self.early_stopping_patience is not None:
+                print(f"{val_loss} : {min_val} : {lr_scheduler.get_last_lr()} : {val_history}")
+                if len(val_history) >= self.early_stopping_patience and all(
+                    [val_loss > other+1e+3 for other in val_history]
                 ):
                     idx, _ = min(enumerate(val_history), key=lambda x: x[1])
                     best_model = model_history[idx]
@@ -494,7 +509,8 @@ class MLPSurrogate(GaussianSurrogate):
                 else:
                     # Current validation loss is better than the one of the last x epochs
                     val_history.append(val_loss)
-                    model_history.append(copy.deepcopy(self.model.state_dict()))
+                    model_history.append(copy.deepcopy(self.model.state_dict()))"""
+        self.model.load_state_dict(best_model)
 
     @torch.no_grad()
     def forward(self, X: np.ndarray, smiles) -> Tuple[np.ndarray, np.ndarray]:
