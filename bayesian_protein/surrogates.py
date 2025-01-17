@@ -451,17 +451,6 @@ class MLPSurrogate(GaussianSurrogate):
 
         super().update(x, y, smiles)
 
-    def __loss_fn_old(self, y_pred, y_real, var_pred):
-        weighting_pred = 0.5
-        weighting_var = 0.5
-        loss_pred = torch.square(y_real-y_pred)/var_pred
-        #loss_var = weighting_var*torch.log(var_pred)
-        #loss_var = 10*torch.log(var_pred)**3
-        loss_var = torch.square(var_pred)
-        #loss_var = var_pred
-        losses = weighting_pred*loss_pred+weighting_var*loss_var
-        return torch.mean(losses,axis=0)
-
     def __loss_fn(self, y_pred, y_real, var_pred):
         weighting_pred = 0/2
         weighting_predvar = 2/10
