@@ -549,16 +549,16 @@ class MLPSurrogate(GaussianSurrogate):
         loader = DataLoader(X, batch_size=self._inf_batch_size, shuffle=False)
 
         mean = []
-        var = []
+        std = []
         self.model.eval()
         for batch in loader:
             batch = batch.to(self.device)
             output = self.model.forward(batch).cpu().numpy().reshape((-1,2))
 
             mean.append(np.atleast_1d(output[:,0]))
-            var.append(np.atleast_1d(np.sqrt(output[:,1])))
+            std.append(np.atleast_1d(np.sqrt(output[:,1])))
             
-        return np.concatenate(mean), np.concatenate(var)
+        return np.concatenate(mean), np.concatenate(std)
 
 
 class MLPCrossValSurrogate(GaussianSurrogate):
