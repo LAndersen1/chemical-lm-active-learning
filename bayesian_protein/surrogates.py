@@ -661,10 +661,12 @@ class MLPCrossValSurrogate(GaussianSurrogate):
             train_ds_block = [block for j, block in enumerate(blocks) if i != j]
             train_ds = torch.utils.data.ConcatDataset(train_ds_block)
             val_ds = blocks[i]
-            if len(train_ds) <= 0:
-                train_ds = val_ds
-            if len(val_ds) <= 0:
-                val_ds = train_ds
+            # In the first iterations we only have a single sample
+            # hence we use the full dataset until we can split it among the models
+            if len(X) <= self.num_models:
+                train_ds = torch.utils.data.ConcatDataset(blocks)
+            if len(X) <= self.num_models:
+                val_ds = torch.utils.data.ConcatDataset(blocks)
             self._fit_fold(i, train_ds, val_ds)
 
     def _fit_fold(self, fold_nr, train_ds, val_ds):
