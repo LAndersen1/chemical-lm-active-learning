@@ -9,7 +9,7 @@ EmbeddingModel = typing.Literal[
 ]
 Simulator = typing.Literal["smina"]
 Surrogate = typing.Literal[
-    "linear-prior", "linear-empirical", "gp", "constant", "mlp", "molformer", "rf"
+    "linear-prior", "linear-empirical", "gp", "constant", "mlp", "molformer", "rf", "mlp-cross"
 ]
 Sampler = typing.Literal[
     "random", "closest", "greedy", "expected-improvement", "explore"
