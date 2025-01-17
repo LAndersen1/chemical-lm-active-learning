@@ -518,8 +518,6 @@ class MLPSurrogate(GaussianSurrogate):
         print("_"*50)
 
         # Train with early stopping
-        #val_history = deque(maxlen=self.early_stopping_patience)
-        #model_history = deque(maxlen=self.early_stopping_patience)
         min_val = None
         best_min_after_n_epochs = 25
         best_model = None
@@ -527,7 +525,7 @@ class MLPSurrogate(GaussianSurrogate):
             self._train_loop(train_loader, optimizer, lr_scheduler)
             val_loss = self._val_loop(val_loader)
             if current_epoch > best_min_after_n_epochs:
-                if(min_val is None):
+                if min_val is None:
                     min_val = val_loss
                     best_model = copy.deepcopy(self.model.state_dict())
                 else:
@@ -536,20 +534,7 @@ class MLPSurrogate(GaussianSurrogate):
                         best_model = copy.deepcopy(self.model.state_dict())
             print(f"{val_loss} : {min_val} : {lr_scheduler.get_last_lr()}")
 
-            # Validation loss has not improved in the last x epochs
-            """if self.early_stopping_patience is not None:
-                print(f"{val_loss} : {min_val} : {lr_scheduler.get_last_lr()} : {val_history}")
-                if len(val_history) >= self.early_stopping_patience and all(
-                    [val_loss > other+1e+3 for other in val_history]
-                ):
-                    idx, _ = min(enumerate(val_history), key=lambda x: x[1])
-                    best_model = model_history[idx]
-                    self.model.load_state_dict(best_model)
-                    break
-                else:
-                    # Current validation loss is better than the one of the last x epochs
-                    val_history.append(val_loss)
-                    model_history.append(copy.deepcopy(self.model.state_dict()))"""
+        # Implicit early stopping, we load the model with the best validation loss
         self.model.load_state_dict(best_model)
 
     @torch.no_grad()
@@ -579,7 +564,7 @@ class MLPSurrogate(GaussianSurrogate):
 class MLPCrossValSurrogate(GaussianSurrogate):
     def __init__(
         self,
-        forward_passes: int = 10,
+        num_models: int = 5,
         retrain: bool = True,
         epochs=150,
     ):
@@ -591,7 +576,7 @@ class MLPCrossValSurrogate(GaussianSurrogate):
         super(MLPCrossValSurrogate, self).__init__()
         self.models = None
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.forward_passes = forward_passes
+        self.num_models = num_models
         self.retrain = retrain
         self.epochs = epochs
 
@@ -600,14 +585,12 @@ class MLPCrossValSurrogate(GaussianSurrogate):
 
     def _build_model(self, input_size: int):
         self.models = []
-        for i in range(5):
+        for i in range(self.num_models):
             m = nn.Sequential(
                     nn.Linear(input_size, 256),
                     nn.GELU(),
-                    #nn.Dropout(p=0.2),
                     nn.Linear(256, 24),
                     nn.GELU(),
-                    #nn.Dropout(p=0.2),
                     nn.Linear(24, 1),
                 ).to(self.device)
             self.models.append(m)
@@ -668,17 +651,14 @@ class MLPCrossValSurrogate(GaussianSurrogate):
             self._restore()
 
         # Setup data
-        tensor_x = torch.as_tensor(X, dtype=torch.float).cuda()
-        tensor_y = torch.as_tensor(y, dtype=torch.float).cuda()
+        tensor_x = torch.as_tensor(X, dtype=torch.float).to(self.device)
+        tensor_y = torch.as_tensor(y, dtype=torch.float).to(self.device)
         ds = TensorDataset(tensor_x, tensor_y)
-        b1, b2, b3, b4, b5 = random_split(ds, lengths=[0.2, 0.2, 0.2, 0.2, 0.2])
+        # We split the data into self.num_models parts, model i is trained on all blocks but i
+        b1, b2, b3, b4, b5 = random_split(ds, lengths=[1/self.num_models for _ in range(self.num_models)])
         blocks = [b1,b2,b3,b4,b5]
-        for i in range(len(self.models)):
-            train_ds_block = []
-            for q in range(len(self.models)):
-                if q==i:
-                    continue
-                train_ds_block.append(blocks[q])
+        for i in range(self.num_models):
+            train_ds_block = [block for j, block in enumerate(blocks) if i != j]
             train_ds = torch.utils.data.ConcatDataset(train_ds_block)
             val_ds = blocks[i]
             if len(train_ds) <= 0:
@@ -700,9 +680,6 @@ class MLPCrossValSurrogate(GaussianSurrogate):
         print(f"TOTAL STEPS {self.epochs*len(train_ds)}")
         print("_"*50)
 
-        # Train with early stopping
-        #val_history = deque(maxlen=self.early_stopping_patience)
-        #model_history = deque(maxlen=self.early_stopping_patience)
         min_val = None
         best_min_after_n_epochs = 25
         best_model = None
@@ -732,7 +709,7 @@ class MLPCrossValSurrogate(GaussianSurrogate):
         loader = DataLoader(X, batch_size=self._inf_batch_size, shuffle=False)
 
         mean = []
-        var = []
+        sem = []
         for batch in loader:
             batch = batch.to(self.device)
             res = []
@@ -741,11 +718,11 @@ class MLPCrossValSurrogate(GaussianSurrogate):
                 res.append(model.forward(batch).squeeze().cpu().numpy())
             res = np.asarray(res)
             mean.append(np.atleast_1d(np.mean(res, axis=0)))
-            #var.append(np.atleast_1d(np.std(res, axis=0)))
-            var.append(np.atleast_1d(scipy.stats.sem(res)))
-            #var.append(np.atleast_1d(res.std(axis=0)/np.sqrt(len(self.models))))
+            sem.append(np.atleast_1d(scipy.stats.sem(res)))
 
-        return np.concatenate(mean), np.concatenate(var)
+        # We return SEM here, we need to check if this leads to theoretical issues
+        # for expected improvement.
+        return np.concatenate(mean), np.concatenate(sem)
 
 
 class MolformerSurrogate(GaussianSurrogate):
