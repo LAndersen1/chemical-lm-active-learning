@@ -655,8 +655,7 @@ class MLPCrossValSurrogate(GaussianSurrogate):
         tensor_y = torch.as_tensor(y, dtype=torch.float).to(self.device)
         ds = TensorDataset(tensor_x, tensor_y)
         # We split the data into self.num_models parts, model i is trained on all blocks but i
-        b1, b2, b3, b4, b5 = random_split(ds, lengths=[1/self.num_models for _ in range(self.num_models)])
-        blocks = [b1,b2,b3,b4,b5]
+        blocks = random_split(ds, lengths=[1/self.num_models for _ in range(self.num_models)])
         for i in range(self.num_models):
             train_ds_block = [block for j, block in enumerate(blocks) if i != j]
             train_ds = torch.utils.data.ConcatDataset(train_ds_block)
