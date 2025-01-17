@@ -384,7 +384,7 @@ class ConstantSurrogate(BaseSurrogate):
 
 
 
-class CustomModel(torch.nn.Module):
+class MVEFeedForward(torch.nn.Module):
     def __init__(self, input_size):
         super().__init__()
         self.model = nn.Sequential(
@@ -396,9 +396,13 @@ class CustomModel(torch.nn.Module):
                     #nn.Dropout(p=0.2),
                     nn.Linear(64, 2),
                 ).cuda()
+        # Softplus to force variance estimation to be positive
         self.softplus = torch.nn.Softplus()
 
     def forward(self, x):
+        """
+        Returns mean and variance estimation
+        """
         res = self.model.forward(x).reshape((-1,2))
         fin = torch.stack([res[:,0], self.softplus(res[:,1])], dim=1)
         return fin
@@ -430,16 +434,7 @@ class MLPSurrogate(GaussianSurrogate):
         self._inf_batch_size = 512
 
     def _build_model(self, input_size: int):
-        self.model = CustomModel(input_size).to(self.device)
-        """self.model = nn.Sequential(
-                    nn.Linear(input_size, 256),
-                    nn.GELU(),
-                    #nn.Dropout(p=0.2),
-                    nn.Linear(256, 24),
-                    nn.GELU(),
-                    #nn.Dropout(p=0.2),
-                    nn.Linear(24, 2),
-                ).to(self.device)"""
+        self.model = MVEFeedForward(input_size).to(self.device)
 
         self._ckpt = copy.deepcopy(self.model.state_dict())
 
