@@ -20,6 +20,8 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 from bayesian_protein.types import VALID_SURROGATE_MODELS, Surrogate
 
+import scipy.stats
+
 
 class BaseSurrogate(abc.ABC):
     def __init__(self):
@@ -264,6 +266,7 @@ class BayesianRidgePrior(RegressorMixin, LinearModel):
 class LinearEmpirical(GaussianSurrogate):
     def __init__(self):
         super().__init__()
+        print("INIT MODEL")
         self._model = BayesianRidge()
 
     def _fit(self, X: np.ndarray, y: np.ndarray):
@@ -271,7 +274,11 @@ class LinearEmpirical(GaussianSurrogate):
         :param X: (N, D) Design matrix
         :param y: (N, 1) Targets
         """
+        print("RELOAD MODEL")
+        self._model = BayesianRidge(lambda_init=1e-7, alpha_1=1e-02, alpha_2=1e-02, lambda_1=1e-02, lambda_2=1e-02)
         self._model.fit(X, y.reshape(-1))
+        print(f"ALPHA: {self._model.alpha_}")
+        print(f"LAMBDA: {self._model.lambda_}")
 
     def forward(self, X: np.ndarray, smiles) -> Tuple[np.ndarray, np.ndarray]:
         self._check_forward_array(X)
@@ -376,13 +383,222 @@ class ConstantSurrogate(BaseSurrogate):
         return np.array([0])
 
 
+
+class CustomModel(torch.nn.Module):
+    def __init__(self, input_size):
+        super().__init__()
+        self.model = nn.Sequential(
+                    nn.Linear(input_size, 128),
+                    nn.GELU(),
+                    #nn.Dropout(p=0.1),
+                    nn.Linear(128, 64),
+                    nn.GELU(),
+                    #nn.Dropout(p=0.2),
+                    nn.Linear(64, 2),
+                ).cuda()
+        self.softplus = torch.nn.Softplus()
+
+    def forward(self, x):
+        res = self.model.forward(x).reshape((-1,2))
+        fin = torch.stack([res[:,0], self.softplus(res[:,1])], dim=1)
+        return fin
+
 class MLPSurrogate(GaussianSurrogate):
     def __init__(
         self,
         forward_passes: int = 10,
         retrain: bool = True,
-        epochs=50,
-        early_stopping_patience: Optional[int] = 5,
+        epochs=350,
+        early_stopping_patience: Optional[int] = 25,
+    ):
+        """
+        :param forward_passes: Number of forward passes
+        :param retrain: Whether to retrain the model after each update
+        :param epochs: Number of training epochs
+        :param early_stopping_patience: Number of epochs to wait before stopping after no improvement in validation loss
+            set to None to disable early stopping
+        """
+        super(MLPSurrogate, self).__init__()
+        self.model = None
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.forward_passes = forward_passes
+        self.retrain = retrain
+        self.epochs = epochs
+        self.early_stopping_patience = early_stopping_patience
+
+        self._train_batch_size = 32
+        self._inf_batch_size = 512
+
+    def _build_model(self, input_size: int):
+        self.model = CustomModel(input_size).to(self.device)
+        """self.model = nn.Sequential(
+                    nn.Linear(input_size, 256),
+                    nn.GELU(),
+                    #nn.Dropout(p=0.2),
+                    nn.Linear(256, 24),
+                    nn.GELU(),
+                    #nn.Dropout(p=0.2),
+                    nn.Linear(24, 2),
+                ).to(self.device)"""
+
+        self._ckpt = copy.deepcopy(self.model.state_dict())
+
+    def _restore(self):
+        if self.model is None:
+            raise ValueError(
+                "Can only be called once 'update' has been called at least once."
+            )
+
+        self.model.load_state_dict(self._ckpt)
+
+    def update(self, x: np.ndarray, y: List[float], smiles: List[str]):
+        self._build_model(x.shape[1])
+
+        super().update(x, y, smiles)
+
+    def __loss_fn_old(self, y_pred, y_real, var_pred):
+        weighting_pred = 0.5
+        weighting_var = 0.5
+        loss_pred = torch.square(y_real-y_pred)/var_pred
+        #loss_var = weighting_var*torch.log(var_pred)
+        #loss_var = 10*torch.log(var_pred)**3
+        loss_var = torch.square(var_pred)
+        #loss_var = var_pred
+        losses = weighting_pred*loss_pred+weighting_var*loss_var
+        return torch.mean(losses,axis=0)
+
+    def __loss_fn(self, y_pred, y_real, var_pred):
+        weighting_pred = 0/2
+        weighting_predvar = 2/10
+        weighting_var = 8/10
+
+        loss_pred = torch.square(y_real-y_pred)
+        loss_predvar = torch.square(y_real-y_pred)/var_pred
+        loss_var = torch.square(var_pred)
+        #loss_var = var_pred
+
+        losses = weighting_predvar*loss_predvar+weighting_pred*loss_pred+weighting_var*loss_var
+        return torch.mean(losses,axis=0)
+
+    def _train_loop(self, loader: DataLoader, optimizer: torch.optim.Optimizer, lr_scheduler):
+        avg = 0
+        self.model.train()
+        for i, (x, y) in enumerate(loader, start=1):
+            x, y = x.to(self.device), y.squeeze().to(self.device)
+            optimizer.zero_grad()
+            output = self.model.forward(x).reshape((-1,2))
+            loss = self.__loss_fn(output[:,0], y, output[:,1])
+            loss.backward()
+            optimizer.step()
+            lr_scheduler.step()
+
+            # Update running average of loss
+            avg += 1 / i * (loss.mean().item() - avg)
+
+        return avg
+
+    @torch.no_grad()
+    def _val_loop(self, loader: DataLoader):
+        avg = 0
+        self.model.eval()
+        for i, (x, y) in enumerate(loader, start=1):
+            x, y = x.to(self.device), y.squeeze().to(self.device)
+            output = self.model.forward(x).reshape((-1,2))
+            loss = self.__loss_fn(output[:,0], y, output[:,1])
+            avg += 1 / i * (loss.mean().item() - avg)
+
+        return avg
+
+    def _fit(self, X: np.ndarray, y: np.ndarray):
+        if self.model is None:
+            raise ValueError(
+                "Can only be called once 'update' has been called at least once."
+            )
+        if self.retrain:
+            self._restore()
+
+        # Setup data
+        tensor_x = torch.as_tensor(X, dtype=torch.float).cuda()
+        tensor_y = torch.as_tensor(y, dtype=torch.float).cuda()
+        ds = TensorDataset(tensor_x, tensor_y)
+        train_ds, val_ds = random_split(ds, lengths=[0.8, 0.2])
+        train_loader = DataLoader(
+            train_ds, batch_size=self._train_batch_size, shuffle=True
+        )
+        val_loader = DataLoader(val_ds, batch_size=self._inf_batch_size, shuffle=False)
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-5)
+        lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.001, total_steps =self.epochs*len(train_loader))
+        print("_"*50)
+        print("REINITING TRAINING")
+        print(f"TOTAL STEPS {self.epochs*len(train_ds)}")
+        print("_"*50)
+
+        # Train with early stopping
+        #val_history = deque(maxlen=self.early_stopping_patience)
+        #model_history = deque(maxlen=self.early_stopping_patience)
+        min_val = None
+        best_min_after_n_epochs = 25
+        best_model = None
+        for current_epoch in range(self.epochs):
+            self._train_loop(train_loader, optimizer, lr_scheduler)
+            val_loss = self._val_loop(val_loader)
+            if current_epoch > best_min_after_n_epochs:
+                if(min_val is None):
+                    min_val = val_loss
+                    best_model = copy.deepcopy(self.model.state_dict())
+                else:
+                    if val_loss <= min_val:
+                        min_val = val_loss
+                        best_model = copy.deepcopy(self.model.state_dict())
+            print(f"{val_loss} : {min_val} : {lr_scheduler.get_last_lr()}")
+
+            # Validation loss has not improved in the last x epochs
+            """if self.early_stopping_patience is not None:
+                print(f"{val_loss} : {min_val} : {lr_scheduler.get_last_lr()} : {val_history}")
+                if len(val_history) >= self.early_stopping_patience and all(
+                    [val_loss > other+1e+3 for other in val_history]
+                ):
+                    idx, _ = min(enumerate(val_history), key=lambda x: x[1])
+                    best_model = model_history[idx]
+                    self.model.load_state_dict(best_model)
+                    break
+                else:
+                    # Current validation loss is better than the one of the last x epochs
+                    val_history.append(val_loss)
+                    model_history.append(copy.deepcopy(self.model.state_dict()))"""
+        self.model.load_state_dict(best_model)
+
+    @torch.no_grad()
+    def forward(self, X: np.ndarray, smiles) -> Tuple[np.ndarray, np.ndarray]:
+        if self.model is None:
+            raise ValueError(
+                "'update' needs to be called at least once before inference."
+            )
+        self._check_forward_array(X)
+
+        X = torch.as_tensor(X, dtype=torch.float)
+        loader = DataLoader(X, batch_size=self._inf_batch_size, shuffle=False)
+
+        mean = []
+        var = []
+        self.model.eval()
+        for batch in loader:
+            batch = batch.to(self.device)
+            output = self.model.forward(batch).cpu().numpy().reshape((-1,2))
+
+            mean.append(np.atleast_1d(output[:,0]))
+            var.append(np.atleast_1d(np.sqrt(output[:,1])))
+            
+        return np.concatenate(mean), np.concatenate(var)
+
+
+class MLPSurrogateOLD(GaussianSurrogate):
+    def __init__(
+        self,
+        forward_passes: int = 10,
+        retrain: bool = True,
+        epochs=150,
+        early_stopping_patience: Optional[int] = 25,
     ):
         """
         :param forward_passes: Number of forward passes
@@ -404,13 +620,13 @@ class MLPSurrogate(GaussianSurrogate):
 
     def _build_model(self, input_size: int):
         self.model = nn.Sequential(
-            nn.Linear(input_size, 100),
+            nn.Linear(input_size, 128),
             nn.ReLU(),
             nn.Dropout(p=0.2),
-            nn.Linear(100, 100),
+            nn.Linear(128, 24),
             nn.ReLU(),
-            nn.Dropout(p=0.2),
-            nn.Linear(100, 1),
+            #nn.Dropout(p=0.2),
+            nn.Linear(24, 1),
         ).to(self.device)
 
         self._ckpt = copy.deepcopy(self.model.state_dict())
@@ -428,16 +644,17 @@ class MLPSurrogate(GaussianSurrogate):
 
         super().update(x, y, smiles)
 
-    def _train_loop(self, loader: DataLoader, optimizer: torch.optim.Optimizer):
+    def _train_loop(self, loader: DataLoader, optimizer: torch.optim.Optimizer, lr_scheduler):
         avg = 0
         self.model.train()
         for i, (x, y) in enumerate(loader, start=1):
             x, y = x.to(self.device), y.squeeze().to(self.device)
             optimizer.zero_grad()
             output = self.model.forward(x).squeeze()
-            loss = nn.functional.mse_loss(output, y)
+            loss = nn.functional.huber_loss(output, y)
             loss.backward()
             optimizer.step()
+            lr_scheduler.step()
 
             # Update running average of loss
             avg += 1 / i * (loss.mean().item() - avg)
@@ -451,7 +668,7 @@ class MLPSurrogate(GaussianSurrogate):
         for i, (x, y) in enumerate(loader, start=1):
             x, y = x.to(self.device), y.squeeze().to(self.device)
             output = self.model.forward(x).squeeze()
-            loss = nn.functional.mse_loss(output, y)
+            loss = nn.functional.huber_loss(output, y)
             avg += 1 / i * (loss.mean().item() - avg)
 
         return avg
@@ -465,27 +682,45 @@ class MLPSurrogate(GaussianSurrogate):
             self._restore()
 
         # Setup data
-        tensor_x = torch.as_tensor(X, dtype=torch.float)
-        tensor_y = torch.as_tensor(y, dtype=torch.float)
+        tensor_x = torch.as_tensor(X, dtype=torch.float).cuda()
+        tensor_y = torch.as_tensor(y, dtype=torch.float).cuda()
         ds = TensorDataset(tensor_x, tensor_y)
         train_ds, val_ds = random_split(ds, lengths=[0.8, 0.2])
         train_loader = DataLoader(
             train_ds, batch_size=self._train_batch_size, shuffle=True
         )
         val_loader = DataLoader(val_ds, batch_size=self._inf_batch_size, shuffle=False)
-        optimizer = torch.optim.Adam(self.model.parameters())
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=1e-5)
+        lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.001, total_steps =self.epochs*len(train_loader))
+        print("_"*50)
+        print("REINITING TRAINING")
+        print(f"TOTAL STEPS {self.epochs*len(train_ds)}")
+        print("_"*50)
 
         # Train with early stopping
-        val_history = deque(maxlen=self.early_stopping_patience)
-        model_history = deque(maxlen=self.early_stopping_patience)
-        for _ in range(self.epochs):
-            self._train_loop(train_loader, optimizer)
+        #val_history = deque(maxlen=self.early_stopping_patience)
+        #model_history = deque(maxlen=self.early_stopping_patience)
+        min_val = None
+        best_min_after_n_epochs = 25
+        best_model = None
+        for current_epoch in range(self.epochs):
+            self._train_loop(train_loader, optimizer, lr_scheduler)
             val_loss = self._val_loop(val_loader)
+            if current_epoch > best_min_after_n_epochs:
+                if(min_val is None):
+                    min_val = val_loss
+                    best_model = copy.deepcopy(self.model.state_dict())
+                else:
+                    if val_loss <= min_val:
+                        min_val = val_loss
+                        best_model = copy.deepcopy(self.model.state_dict())
+            print(f"{val_loss} : {min_val} : {lr_scheduler.get_lr()}")
 
             # Validation loss has not improved in the last x epochs
-            if self.early_stopping_patience is not None:
-                if len(val_history) > self.early_stopping_patience and all(
-                    val_loss > other for other in val_history
+            """if self.early_stopping_patience is not None:
+                print(f"{val_loss} : {min_val} : {lr_scheduler.get_last_lr()} : {val_history}")
+                if len(val_history) >= self.early_stopping_patience and all(
+                    [val_loss > other+1e+3 for other in val_history]
                 ):
                     idx, _ = min(enumerate(val_history), key=lambda x: x[1])
                     best_model = model_history[idx]
@@ -494,7 +729,8 @@ class MLPSurrogate(GaussianSurrogate):
                 else:
                     # Current validation loss is better than the one of the last x epochs
                     val_history.append(val_loss)
-                    model_history.append(copy.deepcopy(self.model.state_dict()))
+                    model_history.append(copy.deepcopy(self.model.state_dict()))"""
+        self.model.load_state_dict(best_model)
 
     @torch.no_grad()
     def forward(self, X: np.ndarray, smiles) -> Tuple[np.ndarray, np.ndarray]:
@@ -521,6 +757,178 @@ class MLPSurrogate(GaussianSurrogate):
             # With a single item mean returns a np.float instead of array which leads to an error when concatenating
             mean.append(np.atleast_1d(outputs.mean(axis=0)))
             var.append(np.atleast_1d(outputs.var(axis=0)))
+
+        return np.concatenate(mean), np.concatenate(var)
+
+
+class MLPCrossValSurrogate(GaussianSurrogate):
+    def __init__(
+        self,
+        forward_passes: int = 10,
+        retrain: bool = True,
+        epochs=150,
+    ):
+        """
+        :param forward_passes: Number of forward passes
+        :param retrain: Whether to retrain the model after each update
+        :param epochs: Number of training epochs
+        """
+        super(MLPCrossValSurrogate, self).__init__()
+        self.models = None
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.forward_passes = forward_passes
+        self.retrain = retrain
+        self.epochs = epochs
+
+        self._train_batch_size = 64
+        self._inf_batch_size = 512
+
+    def _build_model(self, input_size: int):
+        self.models = []
+        for i in range(5):
+            m = nn.Sequential(
+                    nn.Linear(input_size, 256),
+                    nn.GELU(),
+                    #nn.Dropout(p=0.2),
+                    nn.Linear(256, 24),
+                    nn.GELU(),
+                    #nn.Dropout(p=0.2),
+                    nn.Linear(24, 1),
+                ).to(self.device)
+            self.models.append(m)
+        self.known_input_size = input_size
+
+    def _restore(self):
+        if self.models is None:
+            raise ValueError(
+                "Can only be called once 'update' has been called at least once."
+            )
+
+        self._build_model(self.known_input_size)
+
+    def update(self, x: np.ndarray, y: List[float], smiles: List[str]):
+        self._build_model(x.shape[1])
+
+        super().update(x, y, smiles)
+
+    def _train_loop(self, model, loader: DataLoader, optimizer: torch.optim.Optimizer, lr_scheduler):
+        if len(loader) <= 0:
+            return 99.9
+        avg = 0
+        model.train()
+        for i, (x, y) in enumerate(loader, start=1):
+            x, y = x.to(self.device), y.squeeze().to(self.device)
+            optimizer.zero_grad()
+            output = model.forward(x).squeeze()
+            loss = nn.functional.huber_loss(output, y)
+            loss.backward()
+            optimizer.step()
+            lr_scheduler.step()
+
+            # Update running average of loss
+            avg += 1 / i * (loss.mean().item() - avg)
+
+        return avg
+
+    @torch.no_grad()
+    def _val_loop(self, model, loader: DataLoader):
+        if len(loader) <= 0:
+            return 99.9
+        avg = 0
+        model.eval()
+        for i, (x, y) in enumerate(loader, start=1):
+            x, y = x.to(self.device), y.squeeze().to(self.device)
+            output = model.forward(x).squeeze()
+            loss = nn.functional.huber_loss(output, y)
+            avg += 1 / i * (loss.mean().item() - avg)
+
+        return avg
+
+    def _fit(self, X: np.ndarray, y: np.ndarray):
+        if self.models is None:
+            raise ValueError(
+                "Can only be called once 'update' has been called at least once."
+            )
+        if self.retrain:
+            self._restore()
+
+        # Setup data
+        tensor_x = torch.as_tensor(X, dtype=torch.float).cuda()
+        tensor_y = torch.as_tensor(y, dtype=torch.float).cuda()
+        ds = TensorDataset(tensor_x, tensor_y)
+        b1, b2, b3, b4, b5 = random_split(ds, lengths=[0.2, 0.2, 0.2, 0.2, 0.2])
+        blocks = [b1,b2,b3,b4,b5]
+        for i in range(len(self.models)):
+            train_ds_block = []
+            for q in range(len(self.models)):
+                if q==i:
+                    continue
+                train_ds_block.append(blocks[q])
+            train_ds = torch.utils.data.ConcatDataset(train_ds_block)
+            val_ds = blocks[i]
+            if len(train_ds) <= 0:
+                train_ds = val_ds
+            if len(val_ds) <= 0:
+                val_ds = train_ds
+            self._fit_fold(i, train_ds, val_ds)
+
+    def _fit_fold(self, fold_nr, train_ds, val_ds):
+        model = self.models[fold_nr]
+        train_loader = DataLoader(
+            train_ds, batch_size=self._train_batch_size, shuffle=True
+        )
+        val_loader = DataLoader(val_ds, batch_size=self._inf_batch_size, shuffle=False)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
+        lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=0.001, total_steps =self.epochs*len(train_loader))
+        print("_"*50)
+        print("REINITING TRAINING")
+        print(f"TOTAL STEPS {self.epochs*len(train_ds)}")
+        print("_"*50)
+
+        # Train with early stopping
+        #val_history = deque(maxlen=self.early_stopping_patience)
+        #model_history = deque(maxlen=self.early_stopping_patience)
+        min_val = None
+        best_min_after_n_epochs = 25
+        best_model = None
+        for current_epoch in range(self.epochs):
+            self._train_loop(model, train_loader, optimizer, lr_scheduler)
+            val_loss = self._val_loop(model, val_loader)
+            if current_epoch > best_min_after_n_epochs:
+                if(min_val is None):
+                    min_val = val_loss
+                    best_model = copy.deepcopy(model.state_dict())
+                else:
+                    if val_loss <= min_val:
+                        min_val = val_loss
+                        best_model = copy.deepcopy(model.state_dict())
+            print(f"{val_loss} : {min_val} : {lr_scheduler.get_last_lr()}")
+        model.load_state_dict(best_model)
+
+    @torch.no_grad()
+    def forward(self, X: np.ndarray, smiles) -> Tuple[np.ndarray, np.ndarray]:
+        if self.models is None:
+            raise ValueError(
+                "'update' needs to be called at least once before inference."
+            )
+        self._check_forward_array(X)
+
+        X = torch.as_tensor(X, dtype=torch.float)
+        loader = DataLoader(X, batch_size=self._inf_batch_size, shuffle=False)
+
+        mean = []
+        var = []
+        for batch in loader:
+            batch = batch.to(self.device)
+            res = []
+            for model in self.models:
+                model.eval()
+                res.append(model.forward(batch).squeeze().cpu().numpy())
+            res = np.asarray(res)
+            mean.append(np.atleast_1d(np.mean(res, axis=0)))
+            #var.append(np.atleast_1d(np.std(res, axis=0)))
+            var.append(np.atleast_1d(scipy.stats.sem(res)))
+            #var.append(np.atleast_1d(res.std(axis=0)/np.sqrt(len(self.models))))
 
         return np.concatenate(mean), np.concatenate(var)
 
@@ -686,6 +1094,8 @@ def surrogate_factory(surrogate_model: Surrogate) -> BaseSurrogate:
         return ConstantSurrogate()
     elif surrogate_model == "mlp":
         return MLPSurrogate()
+    elif surrogate_model == "mlp-cross":
+        return MLPCrossValSurrogate()
     elif surrogate_model == "molformer":
         return MolformerSurrogate()
     elif surrogate_model == "rf":
